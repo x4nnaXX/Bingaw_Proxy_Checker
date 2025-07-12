@@ -2,65 +2,38 @@ import os
 import sys
 import time
 import csv
+import json
 import aiohttp
 import asyncio
 import argparse
 import ipaddress
 from colorama import Fore, Style, init
 from tqdm import tqdm
-import warnings
-import logging
+from aiohttp_socks import ProxyConnector, ProxyType
 
-warnings.filterwarnings("ignore")
-logging.disable(logging.CRITICAL)
 init(autoreset=True)
-working_count = 0
 output_lock = asyncio.Lock()
 
-BANNER = f"{Fore.RED}{Style.BRIGHT}" + r"""
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1393713235680563282/WH-HgOPhk7mBN2rFVY7FraNe39WPiqIoZIRIvwmhkCPM31iVIe9GHswI1WX4kJadYDDO"
+
+BANNER_TXT = r"""
  ██████╗ ██╗  ██╗██████╗ ██╗███╗   ██╗ ██████╗  █████╗ ██╗    ██╗
 ██╔═████╗╚██╗██╔╝██╔══██╗██║████╗  ██║██╔════╝ ██╔══██╗██║    ██║
 ██║██╔██║ ╚███╔╝ ██████╔╝██║██╔██╗ ██║██║  ███╗███████║██║ █╗ ██║
 ████╔╝██║ ██╔██╗ ██╔══██╗██║██║╚██╗██║██║   ██║██╔══██║██║███╗██║
 ╚██████╔╝██╔╝ ██╗██████╔╝██║██║ ╚████║╚██████╔╝██║  ██║╚███╔███╔╝
  ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝ ╚══╝╚══╝
-""" + Style.RESET_ALL
+"""
 
 DEFAULT_TEST_URLS = [
     "http://icanhazip.com",
-    "http://www.google.com",
-    "http://www.bing.com",
     "http://httpbin.org/ip"
 ]
+DEFAULT_LOG_FILE = "proxy_full_scan.log"
 
-def clear_terminal():
-    try:
-        os.system('cls' if os.name == 'nt' else 'clear')
-    except Exception:
-        pass
-
-def get_term_width():
-    try:
-        return os.get_terminal_size().columns
-    except Exception:
-        return 80
-
-def banner_slideshow(banner, slide_speed=0.05, hold_seconds=2, pause_seconds=1):
-    lines = banner.strip('\n').split('\n')
-    term_width = get_term_width()
-    banner_width = max(len(line) for line in lines)
-    space = max(0, term_width - banner_width)
-    for pad in range(0, space + 1, 2):
-        clear_terminal()
-        for line in lines:
-            print(' ' * pad + line)
-        time.sleep(slide_speed)
-    clear_terminal()
-    for line in lines:
-        print(' ' * (space // 2) + line)
-    time.sleep(hold_seconds)
-    clear_terminal()
-    time.sleep(pause_seconds)
+def print_banner_fixed():
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(Fore.RED + Style.BRIGHT + BANNER_TXT.center(os.get_terminal_size().columns))
 
 def parse_proxy_line(line):
     line = line.strip()
@@ -73,170 +46,230 @@ def parse_proxy_line(line):
         if len(rest) == 1 or len(rest) == 3:
             port = rest[0]
             if port.isdigit() and 1 <= int(port) <= 65535:
-                if len(rest) == 3:
-                    user, pwd = rest[1], rest[2]
-                else:
-                    user, pwd = None, None
-                return f"[{ip}]:{port}", user, pwd
+                return f"[{ip}]:{port}"
         return None
     parts = line.split(":")
-    if len(parts) == 2 or len(parts) == 4:
+    if len(parts) == 2:
         ip, port = parts[0], parts[1]
         try:
             ipaddress.ip_address(ip)
             if port.isdigit() and 1 <= int(port) <= 65535:
-                if len(parts) == 4:
-                    user, pwd = parts[2], parts[3]
-                else:
-                    user, pwd = None, None
-                return f"{ip}:{port}", user, pwd
+                return f"{ip}:{port}"
         except ValueError:
             return None
     return None
 
-async def write_result(proxy, result, fmt, outname, columns):
+def filter_proxies(raw_list):
+    print(Fore.MAGENTA + Style.BRIGHT + "\nFiltering proxies..." + Style.RESET_ALL)
+    time.sleep(1)
+    filtered = []
+    seen = set()
+    for line in raw_list:
+        p = parse_proxy_line(line)
+        if p and p not in seen:
+            filtered.append(p)
+            seen.add(p)
+    print(
+        Fore.YELLOW + f"Total input: {len(raw_list)} | " +
+        Fore.GREEN + f"Valid & unique: {len(filtered)}" + Style.RESET_ALL
+    )
+    print(Fore.LIGHTBLACK_EX + "Waiting 3 seconds before scanning..." + Style.RESET_ALL)
+    time.sleep(3)
+    return filtered
+
+async def write_result(proxy, fmt, outname, extra=None):
     output_file = f"{outname}.{fmt}"
     async with output_lock:
         try:
             if fmt == "txt":
                 with open(output_file, "a") as f:
                     f.write(proxy + "\n")
-            else:
-                write_header = not os.path.isfile(output_file)
+            elif fmt == "csv":
                 with open(output_file, "a", newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=columns)
-                    if write_header:
-                        writer.writeheader()
-                    row = {col: str(result.get(col, "")) for col in columns}
-                    writer.writerow(row)
+                    writer = csv.writer(f)
+                    writer.writerow([proxy] + (extra if extra else []))
+            elif fmt == "json":
+                with open(output_file, "a") as f:
+                    data = {"proxy": proxy}
+                    if extra: data.update(extra)
+                    f.write(json.dumps(data) + "\n")
         except Exception:
             pass
 
-async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user=None, pwd=None, retries=2, alive_queue=None):
-    global working_count
-    for attempt in range(retries):
-        for test_url in test_urls:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                if user and pwd:
-                    proxy_url = f"{ptype}://{user}:{pwd}@{proxy}"
-                else:
-                    proxy_url = f"{ptype}://{proxy}"
-                async with aiohttp.ClientSession(connector=conn) as session:
-                    start = time.perf_counter()
-                    async with session.get(test_url, proxy=proxy_url, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            elapsed = int((time.perf_counter() - start) * 1000)
-                            working_count += 1
-                            result = {
-                                "proxy": proxy,
-                                "ping": elapsed,
-                                "user": user or "",
-                                "pass": pwd or "",
-                                "test_url": test_url
-                            }
-                            await write_result(proxy, result, fmt, outname, columns)
-                            if alive_queue is not None:
-                                await alive_queue.put((proxy, test_url, elapsed))
-                            return
-            except Exception:
-                continue
-        await asyncio.sleep(0.5)
-    # Silent on failure
+async def write_full_log(proxy, status, reason, logfile=DEFAULT_LOG_FILE):
+    async with output_lock:
+        with open(logfile, "a") as f:
+            row = {
+                "proxy": proxy,
+                "status": status,
+                "reason": reason,
+                "timestamp": int(time.time())
+            }
+            f.write(json.dumps(row) + "\n")
 
-async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, test_urls, retries, alive_queue):
-    sem = asyncio.Semaphore(batch_size)
-    async def runner(proxy, user, pwd):
-        async with sem:
-            await check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user, pwd, retries, alive_queue)
-    tasks = []
-    for line in proxies:
-        parsed = parse_proxy_line(line)
-        if parsed:
-            tasks.append(runner(*parsed))
-    total = len(tasks)
-    # Progress bar: green bar, yellow desc, magenta completed count and percent
-    desc_colored = f"{Fore.YELLOW}{Style.BRIGHT}Proxy Checking{Style.RESET_ALL}"
-    with tqdm(total=total, desc=desc_colored, colour="green", ncols=80, leave=True, position=0) as pbar:
-        coros = [task for task in tasks]
-        done_count = 0
-        futures = [asyncio.create_task(coro) for coro in coros]
-        while done_count < total:
-            try:
-                proxy, test_url, elapsed = await asyncio.wait_for(alive_queue.get(), timeout=0.1)
-                print(
-                    f"{Fore.GREEN}{Style.BRIGHT}ALIVE{Style.RESET_ALL}: "
-                    f"{Fore.CYAN}{proxy}{Style.RESET_ALL} | "
-                    f"{Fore.YELLOW}{test_url}{Style.RESET_ALL} | "
-                    f"{Fore.MAGENTA}{elapsed}ms{Style.RESET_ALL}"
-                )
-            except asyncio.TimeoutError:
-                pass
-            done_now = sum(1 for f in futures if f.done())
-            pbar.update(done_now - done_count)
-            done_count = done_now
-            # Magenta for completed/percent (overwrite bar string)
-            bar_str = pbar.format_meter(done_count, total, pbar.format_dict['elapsed'])
-            bar_str = bar_str.replace(f"{done_count}/{total}", f"{Fore.MAGENTA}{Style.BRIGHT}{done_count}/{total}{Style.RESET_ALL}")
-            percent = f"{100 * done_count / total:.1f}%"
-            bar_str = bar_str.replace(percent, f"{Fore.MAGENTA}{Style.BRIGHT}{percent}{Style.RESET_ALL}")
-            pbar.display(bar_str)
-        pbar.refresh()
-
-def get_columns(fmt):
-    base = ["proxy", "ping", "user", "pass", "test_url"]
+async def send_discord_webhook(proxy, ping, test_url, ptype, args_line, enabled=True):
+    if not enabled:
+        return
+    content = (
+        f"**ALIVE:** `{proxy}`\n"
+        f"**Ping:** `{ping}ms`\n"
+        f"**URL:** `{test_url}`\n"
+        f"**Proxy Type:** `{ptype}`\n"
+        f"**Args:** `{args_line}`"
+    )
+    data = {"content": content}
     try:
-        print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
-        pick = input(Fore.CYAN + Style.BRIGHT +
-                     f"Select output columns (comma separated, default: {Fore.YELLOW}{','.join(base)}{Fore.CYAN}): " + Style.RESET_ALL).strip()
-        if pick:
-            cols = [c.strip() for c in pick.split(",") if c.strip() in base]
-            return cols if cols else base
+        async with aiohttp.ClientSession() as session:
+            async with session.post(DISCORD_WEBHOOK_URL, json=data) as resp:
+                await resp.text()
     except Exception:
         pass
-    print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
-    return base
 
-def do_tests():
-    print(Fore.YELLOW + "Running basic unit test...")
-    test_lines = [
-        "127.0.0.1:8080",
-        "[2001:db8::1]:3128",
-        "192.168.1.2:8080:usr:pwd",
-        "[2001:db8::1]:3128:user:pass",
-        "invalid:8080"
-    ]
-    for line in test_lines:
-        res = parse_proxy_line(line)
-        print(f"{line} => {res}")
+def ping_color(ms):
+    if ms <= 100:
+        return Fore.GREEN + Style.BRIGHT
+    elif ms <= 300:
+        return Fore.YELLOW + Style.BRIGHT
+    return Fore.RED + Style.BRIGHT
+
+async def test_http(proxy, test_urls, timeout):
+    for url in test_urls:
+        try:
+            conn = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=conn) as session:
+                start = time.perf_counter()
+                async with session.get(url, proxy=f"http://{proxy}", timeout=timeout) as resp:
+                    if resp.status == 200:
+                        elapsed = int((time.perf_counter() - start) * 1000)
+                        return True, elapsed, url, "http"
+        except Exception:
+            continue
+    return False, None, None, "http"
+
+async def test_socks4(proxy, test_urls, timeout):
+    for url in test_urls:
+        try:
+            conn = ProxyConnector(proxy_type=ProxyType.SOCKS4, host=proxy.split(":")[0], port=int(proxy.split(":")[1]))
+            async with aiohttp.ClientSession(connector=conn) as session:
+                start = time.perf_counter()
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        elapsed = int((time.perf_counter() - start) * 1000)
+                        return True, elapsed, url, "socks4"
+        except Exception:
+            continue
+    return False, None, None, "socks4"
+
+async def test_socks5(proxy, test_urls, timeout):
+    for url in test_urls:
+        try:
+            conn = ProxyConnector(proxy_type=ProxyType.SOCKS5, host=proxy.split(":")[0], port=int(proxy.split(":")[1]))
+            async with aiohttp.ClientSession(connector=conn) as session:
+                start = time.perf_counter()
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        elapsed = int((time.perf_counter() - start) * 1000)
+                        return True, elapsed, url, "socks5"
+        except Exception:
+            continue
+    return False, None, None, "socks5"
+
+async def check_proxy(proxy, ptype, timeout, fmt, outname, test_urls, pbar, retries, args_line, logall=True, discord_enabled=True):
+    success, elapsed, used_url, detected_type = False, None, None, None
+    reason = ""
+    if ptype == "http":
+        for _ in range(1 + retries):
+            success, elapsed, used_url, _ = await test_http(proxy, test_urls, timeout)
+            if success: break
+        detected_type = "http"
+    elif ptype == "socks4":
+        for _ in range(1 + retries):
+            success, elapsed, used_url, _ = await test_socks4(proxy, test_urls, timeout)
+            if success: break
+        detected_type = "socks4"
+    elif ptype == "socks5":
+        for _ in range(1 + retries):
+            success, elapsed, used_url, _ = await test_socks5(proxy, test_urls, timeout)
+            if success: break
+        detected_type = "socks5"
+    else:  # auto-detect
+        for _ in range(1 + retries):
+            for fn in (test_http, test_socks4, test_socks5):
+                success, elapsed, used_url, detected_type = await fn(proxy, test_urls, timeout)
+                if success: break
+            if success: break
+    if success:
+        result_line = (
+            Fore.MAGENTA + Style.BRIGHT + "ALIVE:" + Style.RESET_ALL + " " +
+            Fore.CYAN + Style.BRIGHT + f"{proxy}" + Style.RESET_ALL + " " +
+            ping_color(elapsed) + f"{elapsed}ms" + Style.RESET_ALL + " " +
+            Fore.YELLOW + used_url + Style.RESET_ALL + " " +
+            Fore.LIGHTGREEN_EX + f"[{detected_type}]" + Style.RESET_ALL
+        )
+        tqdm.write(result_line)
+        await write_result(proxy, fmt, outname, [elapsed, used_url, detected_type])
+        await send_discord_webhook(proxy, elapsed, used_url, detected_type, args_line, enabled=discord_enabled)
+        if logall:
+            await write_full_log(proxy, "ALIVE", f"{detected_type}:{elapsed}ms")
+    else:
+        if logall:
+            await write_full_log(proxy, "DEAD", "Timeout or connection failed")
+    pbar.update(1)
+
+async def batch_runner(proxies, ptype, timeout, fmt, outname, threads, test_urls, retries, args_line, logall=True, discord_enabled=True):
+    sem = asyncio.Semaphore(threads)
+    total = len(proxies)
+    with tqdm(total=total, desc=f"{Fore.YELLOW}{Style.BRIGHT}Checking Proxies{Style.RESET_ALL}", ncols=90, leave=True, position=1) as pbar:
+        async def runner(proxy):
+            async with sem:
+                await check_proxy(proxy, ptype, timeout, fmt, outname, test_urls, pbar, retries, args_line, logall, discord_enabled)
+        tasks = [runner(proxy) for proxy in proxies]
+        await asyncio.gather(*tasks)
+        pbar.close()
+
+def numbered_select(options, prompt):
+    for idx, val in enumerate(options):
+        print(f" [{idx+1}] {val}")
+    while True:
+        try:
+            sel = int(input(prompt + f" (1-{len(options)}): ").strip())
+            if 1 <= sel <= len(options):
+                return options[sel - 1]
+        except Exception:
+            print("Invalid input. Please enter a number.")
 
 def get_user_config():
     parser = argparse.ArgumentParser(description="Proxy Checker CLI")
     parser.add_argument('--file', default='proxy.txt')
-    parser.add_argument('--type', default='socks5')
+    parser.add_argument('--type', default='auto', help="Proxy type: http/socks4/socks5/auto")
     parser.add_argument('--threads', type=int, default=100)
-    parser.add_argument('--timeout', type=int, default=5)
-    parser.add_argument('--format', default='txt')
+    parser.add_argument('--timeout', type=int, default=5000, help="Timeout in milliseconds")
+    parser.add_argument('--format', default='txt', help="txt/csv/json")
     parser.add_argument('--out', default='nicenice')
-    parser.add_argument('--test', action='store_true')
-    parser.add_argument('--retries', type=int, default=2)
-    parser.add_argument('--test-urls', nargs='*', default=DEFAULT_TEST_URLS)
+    parser.add_argument('--url', nargs='*', default=DEFAULT_TEST_URLS)
+    parser.add_argument('--yes', action='store_true', help="Skip continue prompt after filtering")
+    parser.add_argument('--retries', type=int, default=1)
+    parser.add_argument('--no-discord', action='store_true', help="Disable Discord notifications")
+    parser.add_argument('--resume', action='store_true', help="Resume from full scan log if exists")
     args = parser.parse_args()
-    allowed_types = ["http", "socks4", "socks5"]
-    allowed_formats = ["txt", "csv"]
-    if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ['test', 'test_urls', 'retries']):
+    allowed_types = ["http", "socks4", "socks5", "auto"]
+    allowed_formats = ["txt", "csv", "json"]
+    yesno_opts = ["Yes", "No"]
+    if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ["yes", "retries", "no_discord", "resume"]):
         print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
         try:
-            args.file = input(Fore.CYAN + Style.BRIGHT + "📄 Proxy file (ip:port): " + Style.RESET_ALL).strip() or args.file
-            args.type = input(Fore.CYAN + Style.BRIGHT + "🌐 Proxy type (http/socks4/socks5): " + Style.RESET_ALL).strip().lower() or args.type
-            args.threads = int(input(Fore.CYAN + Style.BRIGHT + "🧵 Threads: " + Style.RESET_ALL).strip() or args.threads)
-            args.timeout = int(input(Fore.CYAN + Style.BRIGHT + "⏱ Timeout (seconds): " + Style.RESET_ALL).strip() or args.timeout)
-            args.format = input(Fore.CYAN + Style.BRIGHT + "📤 Output format (txt/csv): " + Style.RESET_ALL).strip().lower() or args.format
-            args.out = input(Fore.CYAN + Style.BRIGHT + "💾 Output file name (no ext): " + Style.RESET_ALL).strip() or args.out
-            custom_urls = input(Fore.CYAN + Style.BRIGHT + f"Test URLs (space separated, blank for default): " + Style.RESET_ALL).strip()
-            if custom_urls:
-                args.test_urls = custom_urls.split()
-            args.retries = int(input(Fore.CYAN + Style.BRIGHT + "🔁 Retries per proxy: " + Style.RESET_ALL).strip() or args.retries)
+            args.file = input(Fore.CYAN + Style.BRIGHT + "Proxy file (ip:port): " + Style.RESET_ALL).strip() or args.file
+            args.type = numbered_select(allowed_types, "Select proxy type")
+            args.threads = int(input(Fore.CYAN + Style.BRIGHT + "Threads: " + Style.RESET_ALL).strip() or args.threads)
+            args.timeout = int(input(Fore.CYAN + Style.BRIGHT + "Timeout (ms): " + Style.RESET_ALL).strip() or args.timeout)
+            args.format = numbered_select(allowed_formats, "Select output format")
+            args.out = input(Fore.CYAN + Style.BRIGHT + "Output file name (no ext): " + Style.RESET_ALL).strip() or args.out
+            urls = input(Fore.CYAN + Style.BRIGHT + "Test URLs (space-separated, blank for default): " + Style.RESET_ALL).strip()
+            if urls:
+                args.url = urls.split()
+            args.retries = int(input(Fore.CYAN + Style.BRIGHT + "Retries per URL: " + Style.RESET_ALL).strip() or args.retries)
+            args.no_discord = (numbered_select(yesno_opts, "Disable Discord notifications?") == "Yes")
+            args.resume = (numbered_select(yesno_opts, "Resume from full scan log if exists?") == "Yes")
         except Exception:
             sys.exit(1)
         print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
@@ -246,30 +279,62 @@ def get_user_config():
         sys.exit(1)
     return args
 
+def get_args_line():
+    return " ".join(sys.argv[1:]) or "(interactive mode)"
+
+def load_resume_list(raw_list, logname=DEFAULT_LOG_FILE):
+    checked = set()
+    if os.path.exists(logname):
+        with open(logname, "r") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    checked.add(obj.get("proxy"))
+                except Exception:
+                    continue
+    return [proxy for proxy in raw_list if proxy not in checked]
+
 async def main():
-    banner_slideshow(BANNER)
     args = get_user_config()
-    if args.test:
-        do_tests()
-        return
+    args_line = get_args_line()
     try:
         with open(args.file, "r") as f:
             raw = f.readlines()
     except Exception:
         print(Fore.RED + "Proxy file not found or unreadable.")
         return
-    proxies = [line for line in raw if parse_proxy_line(line)]
+    proxies = filter_proxies(raw)
+    if args.resume and os.path.exists(DEFAULT_LOG_FILE):
+        proxies = load_resume_list(proxies, DEFAULT_LOG_FILE)
+        print(Fore.YELLOW + f"Resuming, {len(proxies)} proxies left to check." + Style.RESET_ALL)
+    if not args.yes:
+        ans = input(Fore.CYAN + "Continue proxy checking? (y/n): " + Style.RESET_ALL).strip().lower()
+        if ans != "y":
+            print(Fore.RED + "Cancelled by user.")
+            return
     if not proxies:
-        print(Fore.RED + "No valid proxies found.")
+        print(Fore.RED + "No valid proxies found after filtering.")
         return
-    columns = get_columns(args.format)
-    alive_queue = asyncio.Queue()
-    await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.test_urls, args.retries, alive_queue)
-    print(Fore.GREEN + Style.BRIGHT + f"\nDone! {working_count} working proxies saved to {args.out}.{args.format}" + Style.RESET_ALL)
+    await batch_runner(
+        proxies, args.type, args.timeout / 1000, args.format, args.out, args.threads,
+        args.url, args.retries, args_line,
+        logall=True, discord_enabled=not args.no_discord
+    )
+    print(Fore.GREEN + Style.BRIGHT + f"\nDone! Working proxies saved to {args.out}.{args.format}" + Style.RESET_ALL)
 
 if __name__ == "__main__":
+    print_banner_fixed()
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        print(Fore.RED + Style.BRIGHT + "\n\n[!] Scan cancelled by user (Ctrl+C)." + Style.RESET_ALL)
+        print(Fore.YELLOW + "Partial results have been saved. Exiting cleanly.\n" + Style.RESET_ALL)
+        sys.exit(0)
     except RuntimeError:
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
+        try:
+            loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            print(Fore.RED + Style.BRIGHT + "\n\n[!] Scan cancelled by user (Ctrl+C)." + Style.RESET_ALL)
+            print(Fore.YELLOW + "Partial results have been saved. Exiting cleanly.\n" + Style.RESET_ALL)
+            sys.exit(0)
