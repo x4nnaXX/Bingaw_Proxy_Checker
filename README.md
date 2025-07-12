@@ -32,12 +32,12 @@ pip install -r requirements.txt
 
 ## 🚀 Run
 
-# Interactive Mode
+ Interactive Mode
 
 ```bash
 python3 proxy_checker.py
 ```
-# Command-line Mode
+ Command-line Mode
 
 ```bash
 python3 proxy_checker.py --file proxy.txt --type http --threads 100 --timeout 5 --format csv --out good_proxies
@@ -45,12 +45,12 @@ python3 proxy_checker.py --file proxy.txt --type http --threads 100 --timeout 5 
 
 ## 🧩 Output Example
 
-# TXT:
+ TXT:
 ```bash
 8.8.8.8:8080
 1.1.1.1:3128
 ```
-# CSV:
+ CSV:
 ```bash
 proxy,country,region,city,org
 8.8.8.8:8080,US,California,Mountain View,Google
