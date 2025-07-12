@@ -37,7 +37,7 @@ pip install -r requirements.txt
 ```bash
 python3 proxy_checker.py
 ```
- Command-line Mode
+ Command-line Mode (Example)
 
 ```bash
 python3 proxy_checker.py --file proxy.txt --type http --threads 100 --timeout 5 --format csv --out good_proxies
