@@ -27,11 +27,22 @@ BANNER = r"""
 """
 
 def clear_terminal():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Clear terminal, ignore any error
+    try:
+        os.system('cls' if os.name == 'nt' else 'clear')
+    except Exception:
+        pass
 
-def banner_slideshow(banner, slide_speed=0.01, hold_seconds=5, pause_seconds=3):
+def get_term_width():
+    try:
+        return os.get_terminal_size().columns
+    except Exception:
+        return 80
+
+def banner_slideshow(banner, slide_speed=0.05, hold_seconds=4, pause_seconds=2):
+    # Slower animation, robust terminal width
     lines = banner.strip('\n').split('\n')
-    term_width = os.get_terminal_size().columns
+    term_width = get_term_width()
     banner_width = max(len(line) for line in lines)
     space = max(0, term_width - banner_width)
     # Slide from left to center
@@ -92,14 +103,15 @@ async def geo_lookup(ip, semaphore, retries=2):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"http://ip-api.com/json/{ip}", timeout=3) as r:
-                        data = await r.json()
-                        return {
-                            "country": data.get("country", ""),
-                            "region": data.get("regionName", ""),
-                            "city": data.get("city", ""),
-                            "org": data.get("org", "")
-                        }
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+                        if r.status == 200:
+                            data = await r.json()
+                            return {
+                                "country": data.get("country", ""),
+                                "region": data.get("regionName", ""),
+                                "city": data.get("city", ""),
+                                "org": data.get("org", "")
+                            }
+            except (aiohttp.ClientError, asyncio.TimeoutError, Exception):
                 pass
             await asyncio.sleep(1)
     return {"country": "", "region": "", "city": "", "org": ""}
@@ -114,17 +126,20 @@ def ping_color(ms):
 async def write_result(proxy, result, fmt, outname, columns):
     output_file = f"{outname}.{fmt}"
     async with output_lock:
-        if fmt == "txt":
-            with open(output_file, "a") as f:
-                f.write(proxy + "\n")
-        else:
-            write_header = not os.path.isfile(output_file)
-            with open(output_file, "a", newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=columns)
-                if write_header:
-                    writer.writeheader()
-                row = {col: str(result.get(col, "")) for col in columns}
-                writer.writerow(row)
+        try:
+            if fmt == "txt":
+                with open(output_file, "a") as f:
+                    f.write(proxy + "\n")
+            else:
+                write_header = not os.path.isfile(output_file)
+                with open(output_file, "a", newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=columns)
+                    if write_header:
+                        writer.writeheader()
+                    row = {col: str(result.get(col, "")) for col in columns}
+                    writer.writerow(row)
+        except Exception as e:
+            tqdm.write(Fore.RED + f"Error writing to {output_file}: {e}")
 
 async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_geo, user=None, pwd=None):
     global working_count
@@ -157,8 +172,8 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_ge
                         "pass": pwd or "",
                     }
                     await write_result(proxy, result, fmt, outname, columns)
-    except Exception:
-        pass
+    except Exception as e:
+        tqdm.write(Fore.RED + f"Proxy check failed for {proxy}: {e}")
 
 async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, geoip_limit):
     sem = asyncio.Semaphore(batch_size)
@@ -166,20 +181,27 @@ async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_siz
     async def runner(proxy, user, pwd):
         async with sem:
             await check_proxy(proxy, ptype, timeout, fmt, outname, columns, geoip_semaphore, user, pwd)
-    tasks = [runner(*parse_proxy_line(line)[:3]) for line in proxies if parse_proxy_line(line)]
+    tasks = []
+    for line in proxies:
+        parsed = parse_proxy_line(line)
+        if parsed:
+            tasks.append(runner(*parsed))
     for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="🔍 Checking", colour="cyan"):
         try:
             await f
-        except Exception:
-            pass
+        except Exception as e:
+            tqdm.write(Fore.RED + f"Error in batch task: {e}")
 
 def get_columns(fmt):
     base = ["proxy", "ping", "country", "region", "city", "org"]
     extra = ["user", "pass"]
-    pick = input(Fore.LIGHTCYAN_EX + f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
-    if pick:
-        cols = [c.strip() for c in pick.split(",") if c.strip() in base + extra]
-        return cols if cols else base
+    try:
+        pick = input(Fore.LIGHTCYAN_EX + f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
+        if pick:
+            cols = [c.strip() for c in pick.split(",") if c.strip() in base + extra]
+            return cols if cols else base
+    except Exception:
+        pass
     return base
 
 def do_tests():
@@ -210,12 +232,16 @@ def get_user_config():
     allowed_formats = ["txt", "csv"]
     if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ['test', 'geoip_limit']):
         print(Style.BRIGHT + Fore.YELLOW + "─── Configuration ───" + Style.RESET_ALL)
-        args.file = input(Fore.LIGHTCYAN_EX + "📄 Proxy file (ip:port): ").strip() or args.file
-        args.type = input(Fore.LIGHTCYAN_EX + "🌐 Proxy type (http/socks4/socks5): ").strip().lower() or args.type
-        args.threads = int(input(Fore.LIGHTCYAN_EX + "🧵 Threads: ").strip() or args.threads)
-        args.timeout = int(input(Fore.LIGHTCYAN_EX + "⏱ Timeout (seconds): ").strip() or args.timeout)
-        args.format = input(Fore.LIGHTCYAN_EX + "📤 Output format (txt/csv): ").strip().lower() or args.format
-        args.out = input(Fore.LIGHTCYAN_EX + "💾 Output file name (no ext): ").strip() or args.out
+        try:
+            args.file = input(Fore.LIGHTCYAN_EX + "📄 Proxy file (ip:port): ").strip() or args.file
+            args.type = input(Fore.LIGHTCYAN_EX + "🌐 Proxy type (http/socks4/socks5): ").strip().lower() or args.type
+            args.threads = int(input(Fore.LIGHTCYAN_EX + "🧵 Threads: ").strip() or args.threads)
+            args.timeout = int(input(Fore.LIGHTCYAN_EX + "⏱ Timeout (seconds): ").strip() or args.timeout)
+            args.format = input(Fore.LIGHTCYAN_EX + "📤 Output format (txt/csv): ").strip().lower() or args.format
+            args.out = input(Fore.LIGHTCYAN_EX + "💾 Output file name (no ext): ").strip() or args.out
+        except Exception as e:
+            print(Fore.RED + f"Error in interactive config: {e}")
+            sys.exit(1)
         print("-" * 45)
     if args.type not in allowed_types:
         print(Fore.RED + f"Invalid proxy type: {args.type}")
@@ -237,8 +263,8 @@ async def main():
     except FileNotFoundError:
         print(Fore.RED + "Proxy file not found.")
         return
-    except Exception:
-        print(Fore.RED + "Error reading proxy file.")
+    except Exception as e:
+        print(Fore.RED + f"Error reading proxy file: {e}")
         return
     proxies = [line for line in raw if parse_proxy_line(line)]
     if not proxies:
