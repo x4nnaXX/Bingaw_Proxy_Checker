@@ -14,7 +14,7 @@ from aiohttp_socks import ProxyConnector, ProxyType
 init(autoreset=True)
 output_lock = asyncio.Lock()
 
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1393713235680563282/WH-HgOPhk7mBN2rFVY7FraNe39WPiqIoZIRIvwmhkCPM31iVIe9GHswI1WX4kJadYDDO"
+DISCORD_WEBHOOK_URL = ""
 
 BANNER_TXT = r"""
  ██████╗ ██╗  ██╗██████╗ ██╗███╗   ██╗ ██████╗  █████╗ ██╗    ██╗
