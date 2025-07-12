@@ -27,7 +27,6 @@ BANNER = r"""
 """
 
 def clear_terminal():
-    # Clear terminal, ignore any error
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
     except Exception:
@@ -40,18 +39,15 @@ def get_term_width():
         return 80
 
 def banner_slideshow(banner, slide_speed=0.05, hold_seconds=4, pause_seconds=2):
-    # Slower animation, robust terminal width
     lines = banner.strip('\n').split('\n')
     term_width = get_term_width()
     banner_width = max(len(line) for line in lines)
     space = max(0, term_width - banner_width)
-    # Slide from left to center
     for pad in range(0, space + 1, 2):
         clear_terminal()
         for line in lines:
             print(' ' * pad + line)
         time.sleep(slide_speed)
-    # Hold centered
     clear_terminal()
     for line in lines:
         print(' ' * (space // 2) + line)
@@ -62,12 +58,10 @@ def banner_slideshow(banner, slide_speed=0.05, hold_seconds=4, pause_seconds=2):
 def supports_emoji():
     return sys.platform != "win32" or "WT_SESSION" in os.environ
 
-EMOJI_OK = Fore.YELLOW + "✔" + Style.RESET_ALL if supports_emoji() else Fore.YELLOW + "[OK]" + Style.RESET_ALL
-
 def parse_proxy_line(line):
     line = line.strip()
-    if not line: return None
-    # IPv6: [2001:db8::1]:3128 or [2001:db8::1]:3128:user:pass
+    if not line:
+        return None
     if line.startswith('['):
         l = line.split(']')
         ip = l[0][1:]
@@ -81,7 +75,6 @@ def parse_proxy_line(line):
                     user, pwd = None, None
                 return f"[{ip}]:{port}", user, pwd
         return None
-    # IPv4: ip:port or ip:port:user:pass
     parts = line.split(":")
     if len(parts) == 2 or len(parts) == 4:
         ip, port = parts[0], parts[1]
@@ -111,17 +104,10 @@ async def geo_lookup(ip, semaphore, retries=2):
                                 "city": data.get("city", ""),
                                 "org": data.get("org", "")
                             }
-            except (aiohttp.ClientError, asyncio.TimeoutError, Exception):
+            except Exception:
                 pass
             await asyncio.sleep(1)
     return {"country": "", "region": "", "city": "", "org": ""}
-
-def ping_color(ms):
-    if ms <= 100:
-        return Fore.GREEN
-    elif ms <= 300:
-        return Fore.YELLOW
-    return Fore.RED
 
 async def write_result(proxy, result, fmt, outname, columns):
     output_file = f"{outname}.{fmt}"
@@ -138,8 +124,8 @@ async def write_result(proxy, result, fmt, outname, columns):
                         writer.writeheader()
                     row = {col: str(result.get(col, "")) for col in columns}
                     writer.writerow(row)
-        except Exception as e:
-            tqdm.write(Fore.RED + f"Error writing to {output_file}: {e}")
+        except Exception:
+            pass
 
 async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_geo, user=None, pwd=None):
     global working_count
@@ -156,11 +142,7 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_ge
                     elapsed = int((time.perf_counter() - start) * 1000)
                     ip = proxy.split(":")[0].strip("[]")
                     geo = await geo_lookup(ip, semaphore_geo)
-                    color = ping_color(elapsed)
                     working_count += 1
-                    geo_info = f"{geo['country']}, {geo['city']}" if geo['country'] else "Unknown"
-                    tqdm.write(color + f"{elapsed}ms {EMOJI_OK} {proxy} " +
-                               f"{Fore.CYAN}({geo_info}) {Fore.MAGENTA}| Alive: {working_count}")
                     result = {
                         "proxy": proxy,
                         "ping": elapsed,
@@ -172,8 +154,11 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_ge
                         "pass": pwd or "",
                     }
                     await write_result(proxy, result, fmt, outname, columns)
-    except Exception as e:
-        tqdm.write(Fore.RED + f"Proxy check failed for {proxy}: {e}")
+                    # SHOW ONLY ALIVE PROXIES:
+                    print(f"{Fore.GREEN}ALIVE: {proxy} | {geo['country']} {geo['city']} | {elapsed}ms{Style.RESET_ALL}")
+    except Exception:
+        # Hide all errors and failed proxies
+        pass
 
 async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, geoip_limit):
     sem = asyncio.Semaphore(batch_size)
@@ -186,17 +171,21 @@ async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_siz
         parsed = parse_proxy_line(line)
         if parsed:
             tasks.append(runner(*parsed))
-    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="🔍 Checking", colour="cyan"):
-        try:
-            await f
-        except Exception as e:
-            tqdm.write(Fore.RED + f"Error in batch task: {e}")
+    total = len(tasks)
+    with tqdm(total=total, desc="Proxy Checking", position=0, leave=True, ncols=80) as pbar:
+        for f in asyncio.as_completed(tasks):
+            try:
+                await f
+            except Exception:
+                pass
+            pbar.update(1)
 
 def get_columns(fmt):
     base = ["proxy", "ping", "country", "region", "city", "org"]
     extra = ["user", "pass"]
     try:
-        pick = input(Fore.LIGHTCYAN_EX + f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
+        pick = input(Fore.LIGHTCYAN_EX +
+                     f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
         if pick:
             cols = [c.strip() for c in pick.split(",") if c.strip() in base + extra]
             return cols if cols else base
@@ -239,15 +228,12 @@ def get_user_config():
             args.timeout = int(input(Fore.LIGHTCYAN_EX + "⏱ Timeout (seconds): ").strip() or args.timeout)
             args.format = input(Fore.LIGHTCYAN_EX + "📤 Output format (txt/csv): ").strip().lower() or args.format
             args.out = input(Fore.LIGHTCYAN_EX + "💾 Output file name (no ext): ").strip() or args.out
-        except Exception as e:
-            print(Fore.RED + f"Error in interactive config: {e}")
+        except Exception:
             sys.exit(1)
         print("-" * 45)
     if args.type not in allowed_types:
-        print(Fore.RED + f"Invalid proxy type: {args.type}")
         sys.exit(1)
     if args.format not in allowed_formats:
-        print(Fore.RED + f"Invalid output format: {args.format}")
         sys.exit(1)
     return args
 
@@ -260,11 +246,8 @@ async def main():
     try:
         with open(args.file, "r") as f:
             raw = f.readlines()
-    except FileNotFoundError:
-        print(Fore.RED + "Proxy file not found.")
-        return
-    except Exception as e:
-        print(Fore.RED + f"Error reading proxy file: {e}")
+    except Exception:
+        print(Fore.RED + "Proxy file not found or unreadable.")
         return
     proxies = [line for line in raw if parse_proxy_line(line)]
     if not proxies:
@@ -272,10 +255,7 @@ async def main():
         return
     columns = get_columns(args.format)
     await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.geoip_limit)
-    if working_count == 0:
-        print(Fore.RED + "\nNo working proxies found.")
-    else:
-        print(Fore.YELLOW + f"\n✅ Done! {working_count} working proxies saved to {args.out}.{args.format}")
+    print(Fore.YELLOW + f"\nDone! {working_count} working proxies saved to {args.out}.{args.format}")
 
 if __name__ == "__main__":
     try:
