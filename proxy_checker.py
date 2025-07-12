@@ -6,7 +6,7 @@ import aiohttp
 import asyncio
 import argparse
 import ipaddress
-from colorama import Fore, Back, Style, init
+from colorama import Fore, Style, init
 from tqdm import tqdm
 import warnings
 import logging
@@ -17,7 +17,6 @@ init(autoreset=True)
 working_count = 0
 output_lock = asyncio.Lock()
 
-# RED banner
 BANNER = f"{Fore.RED}{Style.BRIGHT}" + r"""
  ██████╗ ██╗  ██╗██████╗ ██╗███╗   ██╗ ██████╗  █████╗ ██╗    ██╗
 ██╔═████╗╚██╗██╔╝██╔══██╗██║████╗  ██║██╔════╝ ██╔══██╗██║    ██║
@@ -145,21 +144,6 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, u
         await asyncio.sleep(0.5)
     # Silent on failure
 
-class ColoredTqdmBar(tqdm):
-    def format_bar(self, n):
-        # Green bar, magenta completed/percentage, yellow desc
-        bar = Fore.GREEN + super().format_bar(n) + Style.RESET_ALL
-        return bar
-    def format_meter(self, n, total, elapsed, ncols=None, prefix='', ascii=None, unit='it', unit_scale=False, rate=None, bar_format=None, colour=None, **kwargs):
-        # Magenta completed/percent, yellow desc
-        meter = super().format_meter(n, total, elapsed, ncols, prefix, ascii, unit, unit_scale, rate, bar_format, colour, **kwargs)
-        meter = meter.replace(f"{self.desc}", Fore.YELLOW + Style.BRIGHT + f"{self.desc}" + Style.RESET_ALL)
-        # Color completed/percent
-        meter = meter.replace(f"{n}/{total}", Fore.MAGENTA + Style.BRIGHT + f"{n}/{total}" + Style.RESET_ALL)
-        percent = f"{100 * n / total:.1f}%"
-        meter = meter.replace(percent, Fore.MAGENTA + Style.BRIGHT + percent + Style.RESET_ALL)
-        return meter
-
 async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, test_urls, retries, alive_queue):
     sem = asyncio.Semaphore(batch_size)
     async def runner(proxy, user, pwd):
@@ -171,20 +155,32 @@ async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_siz
         if parsed:
             tasks.append(runner(*parsed))
     total = len(tasks)
-    with ColoredTqdmBar(total=total, desc="Proxy Checking", position=0, leave=True, ncols=80) as pbar:
+    # Progress bar: green bar, yellow desc, magenta completed count and percent
+    desc_colored = f"{Fore.YELLOW}{Style.BRIGHT}Proxy Checking{Style.RESET_ALL}"
+    with tqdm(total=total, desc=desc_colored, colour="green", ncols=80, leave=True, position=0) as pbar:
         coros = [task for task in tasks]
         done_count = 0
         futures = [asyncio.create_task(coro) for coro in coros]
         while done_count < total:
             try:
                 proxy, test_url, elapsed = await asyncio.wait_for(alive_queue.get(), timeout=0.1)
-                print(f"{Fore.GREEN}{Style.BRIGHT}ALIVE{Style.RESET_ALL}: {Fore.CYAN}{proxy}{Style.RESET_ALL} | {Fore.YELLOW}{test_url}{Style.RESET_ALL} | {Fore.MAGENTA}{elapsed}ms{Style.RESET_ALL}")
+                print(
+                    f"{Fore.GREEN}{Style.BRIGHT}ALIVE{Style.RESET_ALL}: "
+                    f"{Fore.CYAN}{proxy}{Style.RESET_ALL} | "
+                    f"{Fore.YELLOW}{test_url}{Style.RESET_ALL} | "
+                    f"{Fore.MAGENTA}{elapsed}ms{Style.RESET_ALL}"
+                )
             except asyncio.TimeoutError:
                 pass
             done_now = sum(1 for f in futures if f.done())
             pbar.update(done_now - done_count)
             done_count = done_now
-            pbar.refresh()
+            # Magenta for completed/percent (overwrite bar string)
+            bar_str = pbar.format_meter(done_count, total, pbar.format_dict['elapsed'])
+            bar_str = bar_str.replace(f"{done_count}/{total}", f"{Fore.MAGENTA}{Style.BRIGHT}{done_count}/{total}{Style.RESET_ALL}")
+            percent = f"{100 * done_count / total:.1f}%"
+            bar_str = bar_str.replace(percent, f"{Fore.MAGENTA}{Style.BRIGHT}{percent}{Style.RESET_ALL}")
+            pbar.display(bar_str)
         pbar.refresh()
 
 def get_columns(fmt):
