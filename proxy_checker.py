@@ -6,7 +6,7 @@ import aiohttp
 import asyncio
 import argparse
 import ipaddress
-from colorama import Fore, Style, init
+from colorama import Fore, Back, Style, init
 from tqdm import tqdm
 import warnings
 import logging
@@ -17,14 +17,15 @@ init(autoreset=True)
 working_count = 0
 output_lock = asyncio.Lock()
 
-BANNER = r"""
+# RED banner
+BANNER = f"{Fore.RED}{Style.BRIGHT}" + r"""
  ██████╗ ██╗  ██╗██████╗ ██╗███╗   ██╗ ██████╗  █████╗ ██╗    ██╗
 ██╔═████╗╚██╗██╔╝██╔══██╗██║████╗  ██║██╔════╝ ██╔══██╗██║    ██║
 ██║██╔██║ ╚███╔╝ ██████╔╝██║██╔██╗ ██║██║  ███╗███████║██║ █╗ ██║
 ████╔╝██║ ██╔██╗ ██╔══██╗██║██║╚██╗██║██║   ██║██╔══██║██║███╗██║
 ╚██████╔╝██╔╝ ██╗██████╔╝██║██║ ╚████║╚██████╔╝██║  ██║╚███╔███╔╝
  ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝ ╚══╝╚══╝
-"""
+""" + Style.RESET_ALL
 
 DEFAULT_TEST_URLS = [
     "http://icanhazip.com",
@@ -112,7 +113,7 @@ async def write_result(proxy, result, fmt, outname, columns):
         except Exception:
             pass
 
-async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user=None, pwd=None, retries=2, pbar=None):
+async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user=None, pwd=None, retries=2, alive_queue=None):
     global working_count
     for attempt in range(retries):
         for test_url in test_urls:
@@ -136,46 +137,68 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, u
                                 "test_url": test_url
                             }
                             await write_result(proxy, result, fmt, outname, columns)
-                            # Only show alive proxies:
-                            print(f"{Fore.GREEN}ALIVE: {proxy} | {test_url} | {elapsed}ms{Style.RESET_ALL}")
-                            if pbar: pbar.refresh()  # keep progress bar at bottom
+                            if alive_queue is not None:
+                                await alive_queue.put((proxy, test_url, elapsed))
                             return
             except Exception:
                 continue
         await asyncio.sleep(0.5)
     # Silent on failure
 
-async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, test_urls, retries):
+class ColoredTqdmBar(tqdm):
+    def format_bar(self, n):
+        # Green bar, magenta completed/percentage, yellow desc
+        bar = Fore.GREEN + super().format_bar(n) + Style.RESET_ALL
+        return bar
+    def format_meter(self, n, total, elapsed, ncols=None, prefix='', ascii=None, unit='it', unit_scale=False, rate=None, bar_format=None, colour=None, **kwargs):
+        # Magenta completed/percent, yellow desc
+        meter = super().format_meter(n, total, elapsed, ncols, prefix, ascii, unit, unit_scale, rate, bar_format, colour, **kwargs)
+        meter = meter.replace(f"{self.desc}", Fore.YELLOW + Style.BRIGHT + f"{self.desc}" + Style.RESET_ALL)
+        # Color completed/percent
+        meter = meter.replace(f"{n}/{total}", Fore.MAGENTA + Style.BRIGHT + f"{n}/{total}" + Style.RESET_ALL)
+        percent = f"{100 * n / total:.1f}%"
+        meter = meter.replace(percent, Fore.MAGENTA + Style.BRIGHT + percent + Style.RESET_ALL)
+        return meter
+
+async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, test_urls, retries, alive_queue):
     sem = asyncio.Semaphore(batch_size)
-    async def runner(proxy, user, pwd, pbar):
+    async def runner(proxy, user, pwd):
         async with sem:
-            await check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user, pwd, retries, pbar)
+            await check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user, pwd, retries, alive_queue)
     tasks = []
     for line in proxies:
         parsed = parse_proxy_line(line)
         if parsed:
-            tasks.append(parsed)
+            tasks.append(runner(*parsed))
     total = len(tasks)
-    with tqdm(total=total, desc="Proxy Checking", position=0, leave=True, ncols=80) as pbar:
-        coros = [runner(*task, pbar) for task in tasks]
-        for f in asyncio.as_completed(coros):
+    with ColoredTqdmBar(total=total, desc="Proxy Checking", position=0, leave=True, ncols=80) as pbar:
+        coros = [task for task in tasks]
+        done_count = 0
+        futures = [asyncio.create_task(coro) for coro in coros]
+        while done_count < total:
             try:
-                await f
-            except Exception:
+                proxy, test_url, elapsed = await asyncio.wait_for(alive_queue.get(), timeout=0.1)
+                print(f"{Fore.GREEN}{Style.BRIGHT}ALIVE{Style.RESET_ALL}: {Fore.CYAN}{proxy}{Style.RESET_ALL} | {Fore.YELLOW}{test_url}{Style.RESET_ALL} | {Fore.MAGENTA}{elapsed}ms{Style.RESET_ALL}")
+            except asyncio.TimeoutError:
                 pass
-            pbar.update(1)
-            pbar.refresh()  # stick at bottom
+            done_now = sum(1 for f in futures if f.done())
+            pbar.update(done_now - done_count)
+            done_count = done_now
+            pbar.refresh()
+        pbar.refresh()
 
 def get_columns(fmt):
     base = ["proxy", "ping", "user", "pass", "test_url"]
     try:
-        pick = input(Fore.LIGHTCYAN_EX +
-                     f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
+        print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
+        pick = input(Fore.CYAN + Style.BRIGHT +
+                     f"Select output columns (comma separated, default: {Fore.YELLOW}{','.join(base)}{Fore.CYAN}): " + Style.RESET_ALL).strip()
         if pick:
             cols = [c.strip() for c in pick.split(",") if c.strip() in base]
             return cols if cols else base
     except Exception:
         pass
+    print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
     return base
 
 def do_tests():
@@ -206,21 +229,21 @@ def get_user_config():
     allowed_types = ["http", "socks4", "socks5"]
     allowed_formats = ["txt", "csv"]
     if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ['test', 'test_urls', 'retries']):
-        print(Style.BRIGHT + Fore.YELLOW + "─── Configuration ───" + Style.RESET_ALL)
+        print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
         try:
-            args.file = input(Fore.LIGHTCYAN_EX + "📄 Proxy file (ip:port): ").strip() or args.file
-            args.type = input(Fore.LIGHTCYAN_EX + "🌐 Proxy type (http/socks4/socks5): ").strip().lower() or args.type
-            args.threads = int(input(Fore.LIGHTCYAN_EX + "🧵 Threads: ").strip() or args.threads)
-            args.timeout = int(input(Fore.LIGHTCYAN_EX + "⏱ Timeout (seconds): ").strip() or args.timeout)
-            args.format = input(Fore.LIGHTCYAN_EX + "📤 Output format (txt/csv): ").strip().lower() or args.format
-            args.out = input(Fore.LIGHTCYAN_EX + "💾 Output file name (no ext): ").strip() or args.out
-            custom_urls = input(Fore.LIGHTCYAN_EX + f"Test URLs (space separated, blank for default): ").strip()
+            args.file = input(Fore.CYAN + Style.BRIGHT + "📄 Proxy file (ip:port): " + Style.RESET_ALL).strip() or args.file
+            args.type = input(Fore.CYAN + Style.BRIGHT + "🌐 Proxy type (http/socks4/socks5): " + Style.RESET_ALL).strip().lower() or args.type
+            args.threads = int(input(Fore.CYAN + Style.BRIGHT + "🧵 Threads: " + Style.RESET_ALL).strip() or args.threads)
+            args.timeout = int(input(Fore.CYAN + Style.BRIGHT + "⏱ Timeout (seconds): " + Style.RESET_ALL).strip() or args.timeout)
+            args.format = input(Fore.CYAN + Style.BRIGHT + "📤 Output format (txt/csv): " + Style.RESET_ALL).strip().lower() or args.format
+            args.out = input(Fore.CYAN + Style.BRIGHT + "💾 Output file name (no ext): " + Style.RESET_ALL).strip() or args.out
+            custom_urls = input(Fore.CYAN + Style.BRIGHT + f"Test URLs (space separated, blank for default): " + Style.RESET_ALL).strip()
             if custom_urls:
                 args.test_urls = custom_urls.split()
-            args.retries = int(input(Fore.LIGHTCYAN_EX + "🔁 Retries per proxy: ").strip() or args.retries)
+            args.retries = int(input(Fore.CYAN + Style.BRIGHT + "🔁 Retries per proxy: " + Style.RESET_ALL).strip() or args.retries)
         except Exception:
             sys.exit(1)
-        print("-" * 45)
+        print(Fore.MAGENTA + Style.BRIGHT + "-" * 45 + Style.RESET_ALL)
     if args.type not in allowed_types:
         sys.exit(1)
     if args.format not in allowed_formats:
@@ -244,8 +267,9 @@ async def main():
         print(Fore.RED + "No valid proxies found.")
         return
     columns = get_columns(args.format)
-    await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.test_urls, args.retries)
-    print(Fore.YELLOW + f"\nDone! {working_count} working proxies saved to {args.out}.{args.format}")
+    alive_queue = asyncio.Queue()
+    await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.test_urls, args.retries, alive_queue)
+    print(Fore.GREEN + Style.BRIGHT + f"\nDone! {working_count} working proxies saved to {args.out}.{args.format}" + Style.RESET_ALL)
 
 if __name__ == "__main__":
     try:
