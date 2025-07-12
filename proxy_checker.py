@@ -1,21 +1,27 @@
 import os
-import re
 import csv
 import aiohttp
 import asyncio
 import argparse
 import sys
 import time
+import ipaddress
 from colorama import Fore, Style, init
-from tqdm.asyncio import tqdm_asyncio
 from tqdm import tqdm
+import warnings
+import logging
 
+warnings.filterwarnings("ignore")
+logging.disable(logging.CRITICAL)
 init(autoreset=True)
 working_count = 0
 output_lock = asyncio.Lock()
 
 def show_banner():
-    os.system("cls" if os.name == "nt" else "clear")
+    try:
+        os.system("cls" if os.name == "nt" else "clear")
+    except Exception:
+        pass
     print(Fore.RED + r"""
  ██████╗ ██╗  ██╗██████╗ ██╗███╗   ██╗ ██████╗  █████╗ ██╗    ██╗
 ██╔═████╗╚██╗██╔╝██╔══██╗██║████╗  ██║██╔════╝ ██╔══██╗██║    ██║
@@ -28,7 +34,7 @@ def show_banner():
 def supports_emoji():
     return sys.platform != "win32" or "WT_SESSION" in os.environ
 
-EMOJI_OK = "✔" if supports_emoji() else Fore.CYAN + "[OK]" + Style.RESET_ALL
+EMOJI_OK = Fore.YELLOW + "✔" + Style.RESET_ALL if supports_emoji() else Fore.YELLOW + "[OK]" + Style.RESET_ALL
 
 def get_user_config():
     parser = argparse.ArgumentParser(description="Proxy Checker CLI")
@@ -54,32 +60,42 @@ def get_user_config():
         print("-" * 45)
 
     if args.type not in allowed_types:
-        print(Fore.RED + f"❌ Invalid proxy type '{args.type}'")
-        exit(1)
+        sys.exit(1)
     if args.format not in allowed_formats:
-        print(Fore.RED + f"❌ Invalid output format '{args.format}'")
-        exit(1)
+        sys.exit(1)
 
     return args.file, args.type, args.threads, args.timeout, args.format, args.out
 
 def validate_proxies(lines):
-    print(Fore.YELLOW + "\n🔍 Validating Proxies...\n")
-    regex = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}$")
-    return [line.strip() for line in lines if regex.match(line.strip())]
+    result = []
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) == 2:
+            ip, port = parts
+            try:
+                ipaddress.IPv4Address(ip)
+                if port.isdigit() and 1 <= int(port) <= 65535:
+                    result.append(line.strip())
+            except ipaddress.AddressValueError:
+                continue
+    return result
 
-async def geo_lookup(ip):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://ip-api.com/json/{ip}", timeout=3) as r:
-                data = await r.json()
-                return {
-                    "country": data.get("country", ""),
-                    "region": data.get("regionName", ""),
-                    "city": data.get("city", ""),
-                    "org": data.get("org", "")
-                }
-    except:
-        return {"country": "", "region": "", "city": "", "org": ""}
+async def geo_lookup(ip, retries=2):
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://ip-api.com/json/{ip}", timeout=3) as r:
+                    data = await r.json()
+                    return {
+                        "country": data.get("country", ""),
+                        "region": data.get("regionName", ""),
+                        "city": data.get("city", ""),
+                        "org": data.get("org", "")
+                    }
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        await asyncio.sleep(1)
+    return {"country": "", "region": "", "city": "", "org": ""}
 
 def ping_color(ms):
     if ms <= 100:
@@ -95,7 +111,7 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname):
         async with aiohttp.ClientSession(connector=conn) as session:
             proxy_url = f"{ptype}://{proxy}"
             start = time.perf_counter()
-            async with session.get("http://httpbin.org/ip", proxy=proxy_url, timeout=timeout) as resp:
+            async with session.get("http://icanhazip.com", proxy=proxy_url, timeout=timeout) as resp:
                 if resp.status == 200:
                     elapsed = int((time.perf_counter() - start) * 1000)
                     geo = await geo_lookup(proxy.split(":")[0])
@@ -105,12 +121,19 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname):
                     tqdm.write(color + f"{elapsed}ms {EMOJI_OK} {proxy} " +
                                f"{Fore.CYAN}({geo_info}) {Fore.MAGENTA}| Alive: {working_count}")
                     async with output_lock:
-                        with open(f"{outname}.{fmt}", "a", newline='') as f:
-                            if fmt == "txt":
+                        output_file = f"{outname}.{fmt}"
+                        output_dir = os.path.dirname(output_file)
+                        if output_dir and not os.path.exists(output_dir):
+                            os.makedirs(output_dir)
+                        # Write to file
+                        if fmt == "txt":
+                            with open(output_file, "a", newline='') as f:
                                 f.write(proxy + "\n")
-                            else:
+                        else:
+                            write_header = not os.path.isfile(output_file)
+                            with open(output_file, "a", newline='') as f:
                                 writer = csv.DictWriter(f, fieldnames=["proxy", "ping", "country", "region", "city", "org"])
-                                if f.tell() == 0:
+                                if write_header:
                                     writer.writeheader()
                                 writer.writerow({
                                     "proxy": proxy,
@@ -120,8 +143,8 @@ async def check_proxy(proxy, ptype, timeout, fmt, outname):
                                     "city": geo["city"],
                                     "org": geo["org"]
                                 })
-    except:
-        pass
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, Exception):
+        pass  # Suppress all errors
 
 async def main():
     show_banner()
@@ -129,13 +152,13 @@ async def main():
     try:
         with open(file, "r") as f:
             raw = f.readlines()
-    except:
-        print(Fore.RED + f"❌ Could not read file '{file}'")
+    except FileNotFoundError:
+        return
+    except Exception:
         return
 
     proxies = validate_proxies(raw)
     if not proxies:
-        print(Fore.RED + "❌ No valid proxies found.")
         return
 
     sem = asyncio.Semaphore(threads)
@@ -145,9 +168,17 @@ async def main():
             await check_proxy(proxy, ptype, timeout, fmt, outname)
 
     tasks = [runner(p) for p in proxies]
-    await tqdm_asyncio.gather(*tasks, total=len(tasks), desc="🔍 Checking", colour="cyan")
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="🔍 Checking", colour="cyan"):
+        try:
+            await f
+        except Exception:
+            pass  # Suppress individual errors
 
     print(Fore.YELLOW + f"\n✅ Done! {working_count} working proxies saved to {outname}.{fmt}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
