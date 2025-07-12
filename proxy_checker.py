@@ -26,6 +26,13 @@ BANNER = r"""
  ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝ ╚══╝╚══╝
 """
 
+DEFAULT_TEST_URLS = [
+    "http://icanhazip.com",
+    "http://www.google.com",
+    "http://www.bing.com",
+    "http://httpbin.org/ip"
+]
+
 def clear_terminal():
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -38,7 +45,7 @@ def get_term_width():
     except Exception:
         return 80
 
-def banner_slideshow(banner, slide_speed=0.05, hold_seconds=4, pause_seconds=2):
+def banner_slideshow(banner, slide_speed=0.05, hold_seconds=2, pause_seconds=1):
     lines = banner.strip('\n').split('\n')
     term_width = get_term_width()
     banner_width = max(len(line) for line in lines)
@@ -54,9 +61,6 @@ def banner_slideshow(banner, slide_speed=0.05, hold_seconds=4, pause_seconds=2):
     time.sleep(hold_seconds)
     clear_terminal()
     time.sleep(pause_seconds)
-
-def supports_emoji():
-    return sys.platform != "win32" or "WT_SESSION" in os.environ
 
 def parse_proxy_line(line):
     line = line.strip()
@@ -90,25 +94,6 @@ def parse_proxy_line(line):
             return None
     return None
 
-async def geo_lookup(ip, semaphore, retries=2):
-    async with semaphore:
-        for attempt in range(retries):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://ip-api.com/json/{ip}", timeout=3) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            return {
-                                "country": data.get("country", ""),
-                                "region": data.get("regionName", ""),
-                                "city": data.get("city", ""),
-                                "org": data.get("org", "")
-                            }
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-    return {"country": "", "region": "", "city": "", "org": ""}
-
 async def write_result(proxy, result, fmt, outname, columns):
     output_file = f"{outname}.{fmt}"
     async with output_lock:
@@ -127,67 +112,67 @@ async def write_result(proxy, result, fmt, outname, columns):
         except Exception:
             pass
 
-async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, semaphore_geo, user=None, pwd=None):
+async def check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user=None, pwd=None, retries=2, pbar=None):
     global working_count
-    try:
-        conn = aiohttp.TCPConnector(ssl=False)
-        if user and pwd:
-            proxy_url = f"{ptype}://{user}:{pwd}@{proxy}"
-        else:
-            proxy_url = f"{ptype}://{proxy}"
-        async with aiohttp.ClientSession(connector=conn) as session:
-            start = time.perf_counter()
-            async with session.get("http://icanhazip.com", proxy=proxy_url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    elapsed = int((time.perf_counter() - start) * 1000)
-                    ip = proxy.split(":")[0].strip("[]")
-                    geo = await geo_lookup(ip, semaphore_geo)
-                    working_count += 1
-                    result = {
-                        "proxy": proxy,
-                        "ping": elapsed,
-                        "country": geo["country"],
-                        "region": geo["region"],
-                        "city": geo["city"],
-                        "org": geo["org"],
-                        "user": user or "",
-                        "pass": pwd or "",
-                    }
-                    await write_result(proxy, result, fmt, outname, columns)
-                    # SHOW ONLY ALIVE PROXIES:
-                    print(f"{Fore.GREEN}ALIVE: {proxy} | {geo['country']} {geo['city']} | {elapsed}ms{Style.RESET_ALL}")
-    except Exception:
-        # Hide all errors and failed proxies
-        pass
+    for attempt in range(retries):
+        for test_url in test_urls:
+            try:
+                conn = aiohttp.TCPConnector(ssl=False)
+                if user and pwd:
+                    proxy_url = f"{ptype}://{user}:{pwd}@{proxy}"
+                else:
+                    proxy_url = f"{ptype}://{proxy}"
+                async with aiohttp.ClientSession(connector=conn) as session:
+                    start = time.perf_counter()
+                    async with session.get(test_url, proxy=proxy_url, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            elapsed = int((time.perf_counter() - start) * 1000)
+                            working_count += 1
+                            result = {
+                                "proxy": proxy,
+                                "ping": elapsed,
+                                "user": user or "",
+                                "pass": pwd or "",
+                                "test_url": test_url
+                            }
+                            await write_result(proxy, result, fmt, outname, columns)
+                            # Only show alive proxies:
+                            print(f"{Fore.GREEN}ALIVE: {proxy} | {test_url} | {elapsed}ms{Style.RESET_ALL}")
+                            if pbar: pbar.refresh()  # keep progress bar at bottom
+                            return
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+    # Silent on failure
 
-async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, geoip_limit):
+async def batch_runner(proxies, ptype, timeout, fmt, outname, columns, batch_size, test_urls, retries):
     sem = asyncio.Semaphore(batch_size)
-    geoip_semaphore = asyncio.Semaphore(geoip_limit)
-    async def runner(proxy, user, pwd):
+    async def runner(proxy, user, pwd, pbar):
         async with sem:
-            await check_proxy(proxy, ptype, timeout, fmt, outname, columns, geoip_semaphore, user, pwd)
+            await check_proxy(proxy, ptype, timeout, fmt, outname, columns, test_urls, user, pwd, retries, pbar)
     tasks = []
     for line in proxies:
         parsed = parse_proxy_line(line)
         if parsed:
-            tasks.append(runner(*parsed))
+            tasks.append(parsed)
     total = len(tasks)
     with tqdm(total=total, desc="Proxy Checking", position=0, leave=True, ncols=80) as pbar:
-        for f in asyncio.as_completed(tasks):
+        coros = [runner(*task, pbar) for task in tasks]
+        for f in asyncio.as_completed(coros):
             try:
                 await f
             except Exception:
                 pass
             pbar.update(1)
+            pbar.refresh()  # stick at bottom
 
 def get_columns(fmt):
-    base = ["proxy", "ping", "country", "region", "city", "org"]
-    extra = ["user", "pass"]
+    base = ["proxy", "ping", "user", "pass", "test_url"]
     try:
         pick = input(Fore.LIGHTCYAN_EX +
                      f"Select output columns (comma separated, default: {','.join(base)}): ").strip()
         if pick:
-            cols = [c.strip() for c in pick.split(",") if c.strip() in base + extra]
+            cols = [c.strip() for c in pick.split(",") if c.strip() in base]
             return cols if cols else base
     except Exception:
         pass
@@ -215,11 +200,12 @@ def get_user_config():
     parser.add_argument('--format', default='txt')
     parser.add_argument('--out', default='nicenice')
     parser.add_argument('--test', action='store_true')
-    parser.add_argument('--geoip-limit', type=int, default=45, help="GeoIP requests per minute (ip-api.com free tier)")
+    parser.add_argument('--retries', type=int, default=2)
+    parser.add_argument('--test-urls', nargs='*', default=DEFAULT_TEST_URLS)
     args = parser.parse_args()
     allowed_types = ["http", "socks4", "socks5"]
     allowed_formats = ["txt", "csv"]
-    if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ['test', 'geoip_limit']):
+    if all(getattr(args, attr) == parser.get_default(attr) for attr in vars(args) if attr not in ['test', 'test_urls', 'retries']):
         print(Style.BRIGHT + Fore.YELLOW + "─── Configuration ───" + Style.RESET_ALL)
         try:
             args.file = input(Fore.LIGHTCYAN_EX + "📄 Proxy file (ip:port): ").strip() or args.file
@@ -228,6 +214,10 @@ def get_user_config():
             args.timeout = int(input(Fore.LIGHTCYAN_EX + "⏱ Timeout (seconds): ").strip() or args.timeout)
             args.format = input(Fore.LIGHTCYAN_EX + "📤 Output format (txt/csv): ").strip().lower() or args.format
             args.out = input(Fore.LIGHTCYAN_EX + "💾 Output file name (no ext): ").strip() or args.out
+            custom_urls = input(Fore.LIGHTCYAN_EX + f"Test URLs (space separated, blank for default): ").strip()
+            if custom_urls:
+                args.test_urls = custom_urls.split()
+            args.retries = int(input(Fore.LIGHTCYAN_EX + "🔁 Retries per proxy: ").strip() or args.retries)
         except Exception:
             sys.exit(1)
         print("-" * 45)
@@ -254,7 +244,7 @@ async def main():
         print(Fore.RED + "No valid proxies found.")
         return
     columns = get_columns(args.format)
-    await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.geoip_limit)
+    await batch_runner(proxies, args.type, args.timeout, args.format, args.out, columns, args.threads, args.test_urls, args.retries)
     print(Fore.YELLOW + f"\nDone! {working_count} working proxies saved to {args.out}.{args.format}")
 
 if __name__ == "__main__":
