@@ -28,7 +28,7 @@ def show_banner():
 def supports_emoji():
     return sys.platform != "win32" or "WT_SESSION" in os.environ
 
-EMOJI_OK = "✔" if supports_emoji() else "[OK]"
+EMOJI_OK = "✔" if supports_emoji() else Fore.CYAN + "[OK]" + Style.RESET_ALL
 
 def get_user_config():
     parser = argparse.ArgumentParser(description="Proxy Checker CLI")
